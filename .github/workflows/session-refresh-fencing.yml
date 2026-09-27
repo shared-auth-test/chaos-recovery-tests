@@ -1,0 +1,48 @@
+name: cross provider session refresh fencing
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh-fencing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22.22.1"
+      - name: Prove refresh takeover uses monotonic fencing
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          let token = 0;
+          let lease = null;
+          let sessionVersion = 0;
+          const acquire = (holder, now, ttl=30) => {
+            if (lease && lease.expires > now && lease.holder !== holder) throw new Error('lease_held');
+            if (lease && lease.expires > now && lease.holder === holder) return lease;
+            lease = { holder, token: ++token, expires: now + ttl };
+            return lease;
+          };
+          const commit = (holder, fencingToken, version) => {
+            if (!lease || lease.holder !== holder || lease.token !== fencingToken) throw new Error('stale_refresh');
+            sessionVersion = Math.max(sessionVersion, version);
+            return sessionVersion;
+          };
+          const first = acquire('supabase-refresh', 0);
+          assert.throws(() => acquire('neon-refresh', 10), /lease_held/);
+          assert.equal(acquire('supabase-refresh', 10).token, first.token, 'same-holder renewal preserves fencing token');
+          const replacement = acquire('neon-refresh', 31);
+          assert.ok(replacement.token > first.token);
+          assert.throws(() => commit('supabase-refresh', first.token, 2), /stale_refresh/);
+          assert.equal(commit('neon-refresh', replacement.token, 2), 2);
+          assert.equal(commit('neon-refresh', replacement.token, 2), 2, 'repeat commit is idempotent');
+          NODE
